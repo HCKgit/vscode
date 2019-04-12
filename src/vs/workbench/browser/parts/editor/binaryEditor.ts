@@ -3,12 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-'use strict';
-
 import * as nls from 'vs/nls';
 import { Event, Emitter } from 'vs/base/common/event';
-import { TPromise } from 'vs/base/common/winjs.base';
-import { Builder, $ } from 'vs/base/browser/builder';
 import { EditorInput, EditorOptions } from 'vs/workbench/common/editor';
 import { BaseEditor } from 'vs/workbench/browser/parts/editor/baseEditor';
 import { BinaryEditorModel } from 'vs/workbench/common/editor/binaryEditorModel';
@@ -17,12 +13,15 @@ import { DomScrollableElement } from 'vs/base/browser/ui/scrollbar/scrollableEle
 import { ScrollbarVisibility } from 'vs/base/common/scrollable';
 import { IThemeService } from 'vs/platform/theme/common/themeService';
 import { ResourceViewerContext, ResourceViewer } from 'vs/workbench/browser/parts/editor/resourceViewer';
-import URI from 'vs/base/common/uri';
-import { Dimension } from 'vs/base/browser/dom';
+import { URI } from 'vs/base/common/uri';
+import { Dimension, size, clearNode } from 'vs/base/browser/dom';
 import { IFileService } from 'vs/platform/files/common/files';
+import { CancellationToken } from 'vs/base/common/cancellation';
+import { dispose } from 'vs/base/common/lifecycle';
+import { IStorageService } from 'vs/platform/storage/common/storage';
 
 export interface IOpenCallbacks {
-	openInternal: (input: EditorInput, options: EditorOptions) => void;
+	openInternal: (input: EditorInput, options: EditorOptions) => Promise<void>;
 	openExternal: (uri: URI) => void;
 }
 
@@ -31,13 +30,17 @@ export interface IOpenCallbacks {
  */
 export abstract class BaseBinaryResourceEditor extends BaseEditor {
 
-	private readonly _onMetadataChanged: Emitter<void>;
+	private readonly _onMetadataChanged: Emitter<void> = this._register(new Emitter<void>());
+	get onMetadataChanged(): Event<void> { return this._onMetadataChanged.event; }
+
+	private readonly _onDidOpenInPlace: Emitter<void> = this._register(new Emitter<void>());
+	get onDidOpenInPlace(): Event<void> { return this._onDidOpenInPlace.event; }
 
 	private callbacks: IOpenCallbacks;
-	private metadata: string;
-	private binaryContainer: Builder;
+	private metadata: string | undefined;
+	private binaryContainer: HTMLElement;
 	private scrollbar: DomScrollableElement;
-	private resourceViewerContext: ResourceViewerContext;
+	private resourceViewerContext: ResourceViewerContext | undefined;
 
 	constructor(
 		id: string,
@@ -45,118 +48,110 @@ export abstract class BaseBinaryResourceEditor extends BaseEditor {
 		telemetryService: ITelemetryService,
 		themeService: IThemeService,
 		@IFileService private readonly _fileService: IFileService,
+		@IStorageService storageService: IStorageService
 	) {
-		super(id, telemetryService, themeService);
-
-		this._onMetadataChanged = new Emitter<void>();
-		this.toUnbind.push(this._onMetadataChanged);
+		super(id, telemetryService, themeService, storageService);
 
 		this.callbacks = callbacks;
 	}
 
-	public get onMetadataChanged(): Event<void> {
-		return this._onMetadataChanged.event;
-	}
-
-	public getTitle(): string {
+	getTitle() {
 		return this.input ? this.input.getName() : nls.localize('binaryEditor', "Binary Viewer");
 	}
 
 	protected createEditor(parent: HTMLElement): void {
 
 		// Container for Binary
-		const binaryContainerElement = document.createElement('div');
-		binaryContainerElement.className = 'binary-container';
-		this.binaryContainer = $(binaryContainerElement);
-		this.binaryContainer.style('outline', 'none');
-		this.binaryContainer.tabindex(0); // enable focus support from the editor part (do not remove)
+		this.binaryContainer = document.createElement('div');
+		this.binaryContainer.className = 'binary-container';
+		this.binaryContainer.style.outline = 'none';
+		this.binaryContainer.tabIndex = 0; // enable focus support from the editor part (do not remove)
 
 		// Custom Scrollbars
-		this.scrollbar = new DomScrollableElement(binaryContainerElement, { horizontal: ScrollbarVisibility.Auto, vertical: ScrollbarVisibility.Auto });
+		this.scrollbar = this._register(new DomScrollableElement(this.binaryContainer, { horizontal: ScrollbarVisibility.Auto, vertical: ScrollbarVisibility.Auto }));
 		parent.appendChild(this.scrollbar.getDomNode());
 	}
 
-	public setInput(input: EditorInput, options?: EditorOptions): TPromise<void> {
+	setInput(input: EditorInput, options: EditorOptions, token: CancellationToken): Promise<void> {
+		return super.setInput(input, options, token).then(() => {
+			return input.resolve().then(model => {
 
-		// Return early for same input unless we force to open
-		const forceOpen = options && options.forceOpen;
-		if (!forceOpen && input.matches(this.input)) {
-			return TPromise.wrap<void>(null);
-		}
-
-		// Otherwise set input and resolve
-		return super.setInput(input, options).then(() => {
-			return input.resolve(true).then(model => {
+				// Check for cancellation
+				if (token.isCancellationRequested) {
+					return undefined;
+				}
 
 				// Assert Model instance
 				if (!(model instanceof BinaryEditorModel)) {
-					return TPromise.wrapError<void>(new Error('Unable to open file as binary'));
-				}
-
-				// Assert that the current input is still the one we expect. This prevents a race condition when loading takes long and another input was set meanwhile
-				if (!this.input || this.input !== input) {
-					return null;
+					return Promise.reject(new Error('Unable to open file as binary'));
 				}
 
 				// Render Input
 				this.resourceViewerContext = ResourceViewer.show(
 					{ name: model.getName(), resource: model.getResource(), size: model.getSize(), etag: model.getETag(), mime: model.getMime() },
 					this._fileService,
-					this.binaryContainer.getHTMLElement(),
+					this.binaryContainer,
 					this.scrollbar,
-					resource => this.callbacks.openInternal(input, options),
+					resource => this.handleOpenInternalCallback(input, options),
 					resource => this.callbacks.openExternal(resource),
 					meta => this.handleMetadataChanged(meta)
 				);
 
-				return TPromise.as<void>(null);
+				return undefined;
 			});
 		});
 	}
 
-	private handleMetadataChanged(meta: string): void {
+	private handleOpenInternalCallback(input: EditorInput, options: EditorOptions) {
+		this.callbacks.openInternal(input, options).then(() => {
+
+			// Signal to listeners that the binary editor has been opened in-place
+			this._onDidOpenInPlace.fire();
+		});
+	}
+
+	private handleMetadataChanged(meta: string | undefined): void {
 		this.metadata = meta;
+
 		this._onMetadataChanged.fire();
 	}
 
-	public getMetadata(): string {
+	getMetadata(): string | undefined {
 		return this.metadata;
 	}
 
-	public supportsCenteredLayout(): boolean {
-		return false;
-	}
-
-	public clearInput(): void {
+	clearInput(): void {
 
 		// Clear Meta
-		this.handleMetadataChanged(null);
+		this.handleMetadataChanged(undefined);
 
-		// Empty HTML Container
-		$(this.binaryContainer).empty();
+		// Clear Resource Viewer
+		clearNode(this.binaryContainer);
+		dispose(this.resourceViewerContext);
+		this.resourceViewerContext = undefined;
 
 		super.clearInput();
 	}
 
-	public layout(dimension: Dimension): void {
+	layout(dimension: Dimension): void {
 
 		// Pass on to Binary Container
-		this.binaryContainer.size(dimension.width, dimension.height);
+		size(this.binaryContainer, dimension.width, dimension.height);
 		this.scrollbar.scanDomNode();
-		if (this.resourceViewerContext) {
+		if (this.resourceViewerContext && this.resourceViewerContext.layout) {
 			this.resourceViewerContext.layout(dimension);
 		}
 	}
 
-	public focus(): void {
-		this.binaryContainer.domFocus();
+	focus(): void {
+		this.binaryContainer.focus();
 	}
 
-	public dispose(): void {
+	dispose(): void {
+		this.binaryContainer.remove();
 
-		// Destroy Container
-		this.binaryContainer.destroy();
-		this.scrollbar.dispose();
+		dispose(this.resourceViewerContext);
+		this.resourceViewerContext = undefined;
 
 		super.dispose();
 	}

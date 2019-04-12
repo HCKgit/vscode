@@ -2,22 +2,19 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 
-import { TPromise } from 'vs/base/common/winjs.base';
-import URI from 'vs/base/common/uri';
+import { URI } from 'vs/base/common/uri';
 import { Event } from 'vs/base/common/event';
 import { IDisposable } from 'vs/base/common/lifecycle';
-import { IEncodingSupport, ConfirmResult } from 'vs/workbench/common/editor';
-import { IBaseStat, IResolveContentOptions, ITextSnapshot } from 'vs/platform/files/common/files';
-import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
+import { IEncodingSupport, ConfirmResult, IRevertOptions } from 'vs/workbench/common/editor';
+import { IResolveContentOptions, ITextSnapshot, IBaseStatWithMetadata, IWriteTextFileOptions, IFileStatWithMetadata } from 'vs/platform/files/common/files';
+import { createDecorator, ServiceIdentifier } from 'vs/platform/instantiation/common/instantiation';
 import { ITextEditorModel } from 'vs/editor/common/services/resolverService';
-import { ITextBufferFactory } from 'vs/editor/common/model';
-import { IRevertOptions } from 'vs/platform/editor/common/editor';
+import { ITextBufferFactory, ITextModel } from 'vs/editor/common/model';
 import { RawContextKey } from 'vs/platform/contextkey/common/contextkey';
 
 /**
- * The save error handler can be installed on the text text file editor model to install code that executes when save errors occur.
+ * The save error handler can be installed on the text file editor model to install code that executes when save errors occur.
  */
 export interface ISaveErrorHandler {
 
@@ -32,13 +29,13 @@ export interface ISaveParticipant {
 	/**
 	 * Participate in a save of a model. Allows to change the model before it is being saved to disk.
 	 */
-	participate(model: ITextFileEditorModel, env: { reason: SaveReason }): void;
+	participate(model: IResolvedTextFileEditorModel, env: { reason: SaveReason }): Promise<void>;
 }
 
 /**
- * States the text text file editor model can be in.
+ * States the text file editor model can be in.
  */
-export enum ModelState {
+export const enum ModelState {
 	SAVED,
 	DIRTY,
 	PENDING_SAVE,
@@ -61,7 +58,7 @@ export enum ModelState {
 	ERROR
 }
 
-export enum StateChange {
+export const enum StateChange {
 	DIRTY,
 	SAVING,
 	SAVE_ERROR,
@@ -81,11 +78,11 @@ export class TextFileModelChangeEvent {
 		this._kind = kind;
 	}
 
-	public get resource(): URI {
+	get resource(): URI {
 		return this._resource;
 	}
 
-	public get kind(): StateChange {
+	get kind(): StateChange {
 		return this._kind;
 	}
 }
@@ -104,12 +101,12 @@ export interface IResult {
 }
 
 export interface IAutoSaveConfiguration {
-	autoSaveDelay: number;
+	autoSaveDelay?: number;
 	autoSaveFocusChange: boolean;
 	autoSaveApplicationChange: boolean;
 }
 
-export enum AutoSaveMode {
+export const enum AutoSaveMode {
 	OFF,
 	AFTER_SHORT_DELAY,
 	AFTER_LONG_DELAY,
@@ -117,16 +114,22 @@ export enum AutoSaveMode {
 	ON_WINDOW_CHANGE
 }
 
-export enum SaveReason {
+export const enum SaveReason {
 	EXPLICIT = 1,
 	AUTO = 2,
 	FOCUS_CHANGE = 3,
 	WINDOW_CHANGE = 4
 }
 
+export const enum LoadReason {
+	EDITOR = 1,
+	REFERENCE = 2,
+	OTHER = 3
+}
+
 export const ITextFileService = createDecorator<ITextFileService>(TEXT_FILE_SERVICE_ID);
 
-export interface IRawTextContent extends IBaseStat {
+export interface IRawTextContent extends IBaseStatWithMetadata {
 
 	/**
 	 * The line grouped content of a text file.
@@ -141,6 +144,10 @@ export interface IRawTextContent extends IBaseStat {
 
 export interface IModelLoadOrCreateOptions {
 
+	/**
+	 * Context why the model is being loaded or created.
+	 */
+	reason?: LoadReason;
 
 	/**
 	 * The encoding to use when resolving the model text content.
@@ -148,9 +155,16 @@ export interface IModelLoadOrCreateOptions {
 	encoding?: string;
 
 	/**
-	 * Wether to reload the model if it already exists.
+	 * If the model was already loaded before, allows to trigger
+	 * a reload of it to fetch the latest contents:
+	 * - async: loadOrCreate() will return immediately and trigger
+	 * a reload that will run in the background.
+	 * - sync: loadOrCreate() will only return resolved when the
+	 * model has finished reloading.
 	 */
-	reload?: boolean;
+	reload?: {
+		async: boolean
+	};
 
 	/**
 	 * Allow to load a model even if we think it is a binary file.
@@ -175,11 +189,11 @@ export interface ITextFileEditorModelManager {
 	onModelsSaved: Event<TextFileModelChangeEvent[]>;
 	onModelsReverted: Event<TextFileModelChangeEvent[]>;
 
-	get(resource: URI): ITextFileEditorModel;
+	get(resource: URI): ITextFileEditorModel | undefined;
 
 	getAll(resource?: URI): ITextFileEditorModel[];
 
-	loadOrCreate(resource: URI, options?: IModelLoadOrCreateOptions): TPromise<ITextFileEditorModel>;
+	loadOrCreate(resource: URI, options?: IModelLoadOrCreateOptions): Promise<ITextFileEditorModel>;
 
 	disposeModel(model: ITextFileEditorModel): void;
 }
@@ -204,6 +218,11 @@ export interface ILoadOptions {
 	 * Allow to load a model even if we think it is a binary file.
 	 */
 	allowBinary?: boolean;
+
+	/**
+	 * Context why the model is being loaded.
+	 */
+	reason?: LoadReason;
 }
 
 export interface ITextFileEditorModel extends ITextEditorModel, IEncodingSupport {
@@ -217,17 +236,17 @@ export interface ITextFileEditorModel extends ITextEditorModel, IEncodingSupport
 
 	hasState(state: ModelState): boolean;
 
-	getETag(): string;
+	getETag(): string | null;
 
 	updatePreferredEncoding(encoding: string): void;
 
-	save(options?: ISaveOptions): TPromise<void>;
+	save(options?: ISaveOptions): Promise<void>;
 
-	load(options?: ILoadOptions): TPromise<ITextFileEditorModel>;
+	load(options?: ILoadOptions): Promise<ITextFileEditorModel>;
 
-	revert(soft?: boolean): TPromise<void>;
+	revert(soft?: boolean): Promise<void>;
 
-	createSnapshot(): ITextSnapshot;
+	createSnapshot(): ITextSnapshot | null;
 
 	isDirty(): boolean;
 
@@ -236,20 +255,34 @@ export interface ITextFileEditorModel extends ITextEditorModel, IEncodingSupport
 	isDisposed(): boolean;
 }
 
+export interface IResolvedTextFileEditorModel extends ITextFileEditorModel {
+	readonly textEditorModel: ITextModel;
+
+	createSnapshot(): ITextSnapshot;
+}
+
+
+export interface IWillMoveEvent {
+	oldResource: URI;
+	newResource: URI;
+
+	waitUntil(p: Promise<unknown>): void;
+}
+
 export interface ITextFileService extends IDisposable {
-	_serviceBrand: any;
-	onAutoSaveConfigurationChange: Event<IAutoSaveConfiguration>;
-	onFilesAssociationChange: Event<void>;
+
+	_serviceBrand: ServiceIdentifier<any>;
+
+	readonly onWillMove: Event<IWillMoveEvent>;
+	readonly onAutoSaveConfigurationChange: Event<IAutoSaveConfiguration>;
+	readonly onFilesAssociationChange: Event<void>;
+
+	readonly isHotExitEnabled: boolean;
 
 	/**
 	 * Access to the manager of text file editor models providing further methods to work with them.
 	 */
-	models: ITextFileEditorModelManager;
-
-	/**
-	 * Resolve the contents of a file identified by the resource.
-	 */
-	resolveTextContent(resource: URI, options?: IResolveContentOptions): TPromise<IRawTextContent>;
+	readonly models: ITextFileEditorModelManager;
 
 	/**
 	 * A resource is dirty if it has unsaved changes or is an untitled file not yet saved.
@@ -274,7 +307,7 @@ export interface ITextFileService extends IDisposable {
 	 * @param options optional save options
 	 * @return true if the resource was saved.
 	 */
-	save(resource: URI, options?: ISaveOptions): TPromise<boolean>;
+	save(resource: URI, options?: ISaveOptions): Promise<boolean>;
 
 	/**
 	 * Saves the provided resource asking the user for a file name or using the provided one.
@@ -282,9 +315,9 @@ export interface ITextFileService extends IDisposable {
 	 * @param resource the resource to save as.
 	 * @param targetResource the optional target to save to.
 	 * @param options optional save options
-	 * @return true if the file was saved.
+	 * @return Path of the saved resource.
 	 */
-	saveAs(resource: URI, targetResource?: URI, options?: ISaveOptions): TPromise<URI>;
+	saveAs(resource: URI, targetResource?: URI, options?: ISaveOptions): Promise<URI | undefined>;
 
 	/**
 	 * Saves the set of resources and returns a promise with the operation result.
@@ -292,8 +325,8 @@ export interface ITextFileService extends IDisposable {
 	 * @param resources can be null to save all.
 	 * @param includeUntitled to save all resources and optionally exclude untitled ones.
 	 */
-	saveAll(includeUntitled?: boolean, options?: ISaveOptions): TPromise<ITextFileOperationResult>;
-	saveAll(resources: URI[], options?: ISaveOptions): TPromise<ITextFileOperationResult>;
+	saveAll(includeUntitled?: boolean, options?: ISaveOptions): Promise<ITextFileOperationResult>;
+	saveAll(resources: URI[], options?: ISaveOptions): Promise<ITextFileOperationResult>;
 
 	/**
 	 * Reverts the provided resource.
@@ -301,12 +334,38 @@ export interface ITextFileService extends IDisposable {
 	 * @param resource the resource of the file to revert.
 	 * @param force to force revert even when the file is not dirty
 	 */
-	revert(resource: URI, options?: IRevertOptions): TPromise<boolean>;
+	revert(resource: URI, options?: IRevertOptions): Promise<boolean>;
 
 	/**
 	 * Reverts all the provided resources and returns a promise with the operation result.
 	 */
-	revertAll(resources?: URI[], options?: IRevertOptions): TPromise<ITextFileOperationResult>;
+	revertAll(resources?: URI[], options?: IRevertOptions): Promise<ITextFileOperationResult>;
+
+	/**
+	 * Create a file. If the file exists it will be overwritten with the contents if
+	 * the options enable to overwrite.
+	 */
+	create(resource: URI, contents?: string | ITextSnapshot, options?: { overwrite?: boolean }): Promise<IFileStatWithMetadata>;
+
+	/**
+	 * Resolve the contents of a file identified by the resource.
+	 */
+	resolve(resource: URI, options?: IResolveContentOptions): Promise<IRawTextContent>;
+
+	/**
+	 * Update a file with given contents.
+	 */
+	write(resource: URI, value: string | ITextSnapshot, options?: IWriteTextFileOptions): Promise<IFileStatWithMetadata>;
+
+	/**
+	 * Delete a file. If the file is dirty, it will get reverted and then deleted from disk.
+	 */
+	delete(resource: URI, options?: { useTrash?: boolean, recursive?: boolean }): Promise<void>;
+
+	/**
+	 * Move a file. If the file is dirty, its contents will be preserved and restored.
+	 */
+	move(source: URI, target: URI, overwrite?: boolean): Promise<void>;
 
 	/**
 	 * Brings up the confirm dialog to either save, don't save or cancel.
@@ -314,7 +373,7 @@ export interface ITextFileService extends IDisposable {
 	 * @param resources the resources of the files to ask for confirmation or null if
 	 * confirming for all dirty resources.
 	 */
-	confirmSave(resources?: URI[]): TPromise<ConfirmResult>;
+	confirmSave(resources?: URI[]): Promise<ConfirmResult>;
 
 	/**
 	 * Convinient fast access to the current auto save mode.
@@ -325,9 +384,4 @@ export interface ITextFileService extends IDisposable {
 	 * Convinient fast access to the raw configured auto save settings.
 	 */
 	getAutoSaveConfiguration(): IAutoSaveConfiguration;
-
-	/**
-	 * Convinient fast access to the hot exit file setting.
-	 */
-	isHotExitEnabled: boolean;
 }

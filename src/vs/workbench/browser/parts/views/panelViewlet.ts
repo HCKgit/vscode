@@ -5,11 +5,10 @@
 
 import 'vs/css!./media/panelviewlet';
 import * as nls from 'vs/nls';
-import { TPromise } from 'vs/base/common/winjs.base';
-import { Event, Emitter, filterEvent } from 'vs/base/common/event';
-import { ColorIdentifier, contrastBorder } from 'vs/platform/theme/common/colorRegistry';
+import { Event, Emitter } from 'vs/base/common/event';
+import { ColorIdentifier } from 'vs/platform/theme/common/colorRegistry';
 import { attachStyler, IColorMapping } from 'vs/platform/theme/common/styler';
-import { SIDE_BAR_DRAG_AND_DROP_BACKGROUND, SIDE_BAR_SECTION_HEADER_FOREGROUND, SIDE_BAR_SECTION_HEADER_BACKGROUND } from 'vs/workbench/common/theme';
+import { SIDE_BAR_DRAG_AND_DROP_BACKGROUND, SIDE_BAR_SECTION_HEADER_FOREGROUND, SIDE_BAR_SECTION_HEADER_BACKGROUND, SIDE_BAR_SECTION_HEADER_BORDER } from 'vs/workbench/common/theme';
 import { append, $, trackFocus, toggleClass, EventType, isAncestor, Dimension, addDisposableListener } from 'vs/base/browser/dom';
 import { IDisposable, combinedDisposable } from 'vs/base/common/lifecycle';
 import { firstIndex } from 'vs/base/common/arrays';
@@ -25,36 +24,51 @@ import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { IThemeService } from 'vs/platform/theme/common/themeService';
 import { PanelView, IPanelViewOptions, IPanelOptions, Panel } from 'vs/base/browser/ui/splitview/panelview';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
-import { IPartService } from 'vs/workbench/services/part/common/partService';
+import { IWorkbenchLayoutService } from 'vs/workbench/services/layout/browser/layoutService';
 import { StandardMouseEvent } from 'vs/base/browser/mouseEvent';
+import { IView } from 'vs/workbench/common/views';
+import { IStorageService } from 'vs/platform/storage/common/storage';
+import { withNullAsUndefined } from 'vs/base/common/types';
 
 export interface IPanelColors extends IColorMapping {
 	dropBackground?: ColorIdentifier;
 	headerForeground?: ColorIdentifier;
 	headerBackground?: ColorIdentifier;
-	headerHighContrastBorder?: ColorIdentifier;
+	headerBorder?: ColorIdentifier;
 }
 
 export interface IViewletPanelOptions extends IPanelOptions {
 	actionRunner?: IActionRunner;
+	id: string;
+	title: string;
 }
 
-export abstract class ViewletPanel extends Panel {
+export abstract class ViewletPanel extends Panel implements IView {
 
 	private static AlwaysShowActionsConfig = 'workbench.view.alwaysShowHeaderActions';
 
 	private _onDidFocus = new Emitter<void>();
 	readonly onDidFocus: Event<void> = this._onDidFocus.event;
 
-	private _onDidChangeTitleArea = new Emitter<void>();
+	private _onDidBlur = new Emitter<void>();
+	readonly onDidBlur: Event<void> = this._onDidBlur.event;
+
+	private _onDidChangeBodyVisibility = new Emitter<boolean>();
+	readonly onDidChangeBodyVisibility: Event<boolean> = this._onDidChangeBodyVisibility.event;
+
+	protected _onDidChangeTitleArea = new Emitter<void>();
 	readonly onDidChangeTitleArea: Event<void> = this._onDidChangeTitleArea.event;
 
-	protected actionRunner: IActionRunner;
+	private _isVisible: boolean = false;
+	readonly id: string;
+	readonly title: string;
+
+	protected actionRunner?: IActionRunner;
 	protected toolbar: ToolBar;
 	private headerContainer: HTMLElement;
+	private titleContainer: HTMLElement;
 
 	constructor(
-		readonly title: string,
 		options: IViewletPanelOptions,
 		@IKeybindingService protected keybindingService: IKeybindingService,
 		@IContextMenuService protected contextMenuService: IContextMenuService,
@@ -62,7 +76,38 @@ export abstract class ViewletPanel extends Panel {
 	) {
 		super(options);
 
+		this.id = options.id;
+		this.title = options.title;
 		this.actionRunner = options.actionRunner;
+
+		this.disposables.push(this._onDidFocus, this._onDidBlur, this._onDidChangeBodyVisibility, this._onDidChangeTitleArea);
+	}
+
+	setVisible(visible: boolean): void {
+		if (this._isVisible !== visible) {
+			this._isVisible = visible;
+
+			if (this.isExpanded()) {
+				this._onDidChangeBodyVisibility.fire(visible);
+			}
+		}
+	}
+
+	isVisible(): boolean {
+		return this._isVisible;
+	}
+
+	isBodyVisible(): boolean {
+		return this._isVisible && this.isExpanded();
+	}
+
+	setExpanded(expanded: boolean): boolean {
+		const changed = super.setExpanded(expanded);
+		if (changed) {
+			this._onDidChangeBodyVisibility.fire(expanded);
+		}
+
+		return changed;
 	}
 
 	render(): void {
@@ -71,32 +116,38 @@ export abstract class ViewletPanel extends Panel {
 		const focusTracker = trackFocus(this.element);
 		this.disposables.push(focusTracker);
 		this.disposables.push(focusTracker.onDidFocus(() => this._onDidFocus.fire()));
+		this.disposables.push(focusTracker.onDidBlur(() => this._onDidBlur.fire()));
 	}
 
 	protected renderHeader(container: HTMLElement): void {
 		this.headerContainer = container;
 
-		this.renderHeaderTitle(container);
+		this.renderHeaderTitle(container, this.title);
 
 		const actions = append(container, $('.actions'));
 		this.toolbar = new ToolBar(actions, this.contextMenuService, {
 			orientation: ActionsOrientation.HORIZONTAL,
 			actionItemProvider: action => this.getActionItem(action),
 			ariaLabel: nls.localize('viewToolbarAriaLabel', "{0} actions", this.title),
-			getKeyBinding: action => this.keybindingService.lookupKeybinding(action.id),
+			getKeyBinding: action => withNullAsUndefined(this.keybindingService.lookupKeybinding(action.id)),
 			actionRunner: this.actionRunner
 		});
 
 		this.disposables.push(this.toolbar);
 		this.setActions();
 
-		const onDidRelevantConfigurationChange = filterEvent(this.configurationService.onDidChangeConfiguration, e => e.affectsConfiguration(ViewletPanel.AlwaysShowActionsConfig));
+		const onDidRelevantConfigurationChange = Event.filter(this.configurationService.onDidChangeConfiguration, e => e.affectsConfiguration(ViewletPanel.AlwaysShowActionsConfig));
 		onDidRelevantConfigurationChange(this.updateActionsVisibility, this, this.disposables);
 		this.updateActionsVisibility();
 	}
 
-	protected renderHeaderTitle(container: HTMLElement): void {
-		append(container, $('.title', null, this.title));
+	protected renderHeaderTitle(container: HTMLElement, title: string): void {
+		this.titleContainer = append(container, $('h3.title', undefined, title));
+	}
+
+	protected updateTitle(title: string): void {
+		this.titleContainer.textContent = title;
+		this._onDidChangeTitleArea.fire();
 	}
 
 	focus(): void {
@@ -129,16 +180,20 @@ export abstract class ViewletPanel extends Panel {
 		return [];
 	}
 
-	getActionItem(action: IAction): IActionItem {
-		return null;
+	getActionItem(action: IAction): IActionItem | undefined {
+		return undefined;
 	}
 
-	getActionsContext(): any {
+	getActionsContext(): unknown {
 		return undefined;
 	}
 
 	getOptimalWidth(): number {
 		return 0;
+	}
+
+	saveState(): void {
+		// Subclasses to implement for saving state
 	}
 }
 
@@ -157,7 +212,7 @@ export class PanelViewlet extends Viewlet {
 	private panelItems: IViewletPanelItem[] = [];
 	private panelview: PanelView;
 
-	get onDidSashChange(): Event<void> {
+	get onDidSashChange(): Event<number> {
 		return this.panelview.onDidSashChange;
 	}
 
@@ -172,17 +227,18 @@ export class PanelViewlet extends Viewlet {
 	constructor(
 		id: string,
 		private options: IViewsViewletOptions,
-		@IPartService partService: IPartService,
+		@IConfigurationService configurationService: IConfigurationService,
+		@IWorkbenchLayoutService layoutService: IWorkbenchLayoutService,
 		@IContextMenuService protected contextMenuService: IContextMenuService,
 		@ITelemetryService telemetryService: ITelemetryService,
-		@IThemeService themeService: IThemeService
+		@IThemeService themeService: IThemeService,
+		@IStorageService storageService: IStorageService
 	) {
-		super(id, partService, telemetryService, themeService);
+		super(id, configurationService, layoutService, telemetryService, themeService, storageService);
 	}
 
-	async create(parent: HTMLElement): TPromise<void> {
+	create(parent: HTMLElement): void {
 		super.create(parent);
-
 		this.panelview = this._register(new PanelView(parent, this.options));
 		this._register(this.panelview.onDidDrop(({ from, to }) => this.movePanel(from as ViewletPanel, to as ViewletPanel)));
 		this._register(addDisposableListener(parent, EventType.CONTEXT_MENU, (e: MouseEvent) => this.showContextMenu(new StandardMouseEvent(e))));
@@ -202,7 +258,7 @@ export class PanelViewlet extends Viewlet {
 		let anchor: { x: number, y: number } = { x: event.posx, y: event.posy };
 		this.contextMenuService.showContextMenu({
 			getAnchor: () => anchor,
-			getActions: () => TPromise.as(this.getContextMenuActions())
+			getActions: () => this.getContextMenuActions()
 		});
 	}
 
@@ -210,7 +266,8 @@ export class PanelViewlet extends Viewlet {
 		let title = Registry.as<ViewletRegistry>(Extensions.Viewlets).getViewlet(this.getId()).name;
 
 		if (this.isSingleView()) {
-			title += ': ' + this.panelItems[0].panel.title;
+			const panelItemTitle = this.panelItems[0].panel.title;
+			title = panelItemTitle ? `${title}: ${panelItemTitle}` : title;
 		}
 
 		return title;
@@ -232,7 +289,7 @@ export class PanelViewlet extends Viewlet {
 		return [];
 	}
 
-	getActionItem(action: IAction): IActionItem {
+	getActionItem(action: IAction): IActionItem | undefined {
 		if (this.isSingleView()) {
 			return this.panelItems[0].panel.getActionItem(action);
 		}
@@ -256,7 +313,7 @@ export class PanelViewlet extends Viewlet {
 	}
 
 	layout(dimension: Dimension): void {
-		this.panelview.layout(dimension.height);
+		this.panelview.layout(dimension.height, dimension.width);
 	}
 
 	getOptimalWidth(): number {
@@ -296,7 +353,7 @@ export class PanelViewlet extends Viewlet {
 		const panelStyler = attachStyler<IPanelColors>(this.themeService, {
 			headerForeground: SIDE_BAR_SECTION_HEADER_FOREGROUND,
 			headerBackground: SIDE_BAR_SECTION_HEADER_BACKGROUND,
-			headerHighContrastBorder: index === 0 ? null : contrastBorder,
+			headerBorder: SIDE_BAR_SECTION_HEADER_BORDER,
 			dropBackground: SIDE_BAR_DRAG_AND_DROP_BACKGROUND
 		}, panel);
 		const disposable = combinedDisposable([onDidFocus, onDidChangeTitleArea, panelStyler, onDidChange]);

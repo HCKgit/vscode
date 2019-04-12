@@ -2,28 +2,68 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-'use strict';
 
-import { TPromise } from 'vs/base/common/winjs.base';
-import * as paths from 'vs/base/common/paths';
-import URI from 'vs/base/common/uri';
+import { sep } from 'vs/base/common/path';
+import { URI } from 'vs/base/common/uri';
 import * as glob from 'vs/base/common/glob';
 import { isLinux } from 'vs/base/common/platform';
-import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
+import { createDecorator, ServiceIdentifier } from 'vs/platform/instantiation/common/instantiation';
 import { Event } from 'vs/base/common/event';
 import { startsWithIgnoreCase } from 'vs/base/common/strings';
 import { IDisposable } from 'vs/base/common/lifecycle';
 import { isEqualOrParent, isEqual } from 'vs/base/common/resources';
 import { isUndefinedOrNull } from 'vs/base/common/types';
+import { VSBuffer, VSBufferReadable } from 'vs/base/common/buffer';
 
 export const IFileService = createDecorator<IFileService>('fileService');
 
 export interface IResourceEncodings {
-	getWriteEncoding(resource: URI, preferredEncoding?: string): string;
+	getWriteEncoding(resource: URI, preferredEncoding?: string): IResourceEncoding;
+}
+
+export interface IResourceEncoding {
+	encoding: string;
+	hasBOM: boolean;
 }
 
 export interface IFileService {
-	_serviceBrand: any;
+
+	_serviceBrand: ServiceIdentifier<any>;
+
+	//#region File System Provider
+
+	/**
+	 * An event that is fired when a file system provider is added or removed
+	 */
+	readonly onDidChangeFileSystemProviderRegistrations: Event<IFileSystemProviderRegistrationEvent>;
+
+	/**
+	 * An event that is fired when a file system provider is about to be activated. Listeners
+	 * can join this event with a long running promise to help in the activation process.
+	 */
+	readonly onWillActivateFileSystemProvider: Event<IFileSystemProviderActivationEvent>;
+
+	/**
+	 * Registers a file system provider for a certain scheme.
+	 */
+	registerProvider(scheme: string, provider: IFileSystemProvider): IDisposable;
+
+	/**
+	 * Tries to activate a provider with the given scheme.
+	 */
+	activateProvider(scheme: string): Promise<void>;
+
+	/**
+	 * Checks if this file service can handle the given resource.
+	 */
+	canHandleResource(resource: URI): boolean;
+
+	/**
+	 * Checks if the provider for the provided resource has the provided file system capability.
+	 */
+	hasCapability(resource: URI, capability: FileSystemProviderCapabilities): boolean;
+
+	//#endregion
 
 	/**
 	 * Helper to determine read/write encoding for resources.
@@ -32,32 +72,17 @@ export interface IFileService {
 
 	/**
 	 * Allows to listen for file changes. The event will fire for every file within the opened workspace
-	 * (if any) as well as all files that have been watched explicitly using the #watchFileChanges() API.
+	 * (if any) as well as all files that have been watched explicitly using the #watch() API.
 	 */
-	onFileChanges: Event<FileChangesEvent>;
+	readonly onFileChanges: Event<FileChangesEvent>;
 
 	/**
 	 * An event that is fired upon successful completion of a certain file operation.
 	 */
-	onAfterOperation: Event<FileOperationEvent>;
+	readonly onAfterOperation: Event<FileOperationEvent>;
 
 	/**
-	 * An event that is fired when a file system provider is added or removed
-	 */
-	onDidChangeFileSystemProviderRegistrations: Event<IFileSystemProviderRegistrationEvent>;
-
-	/**
-	 * Registeres a file system provider for a certain scheme.
-	 */
-	registerProvider(scheme: string, provider: IFileSystemProvider): IDisposable;
-
-	/**
-	 * Checks if this file service can handle the given resource.
-	 */
-	canHandleResource(resource: URI): boolean;
-
-	/**
-	 * Resolve the properties of a file identified by the resource.
+	 * Resolve the properties of a file/folder identified by the resource.
 	 *
 	 * If the optional parameter "resolveTo" is specified in options, the stat service is asked
 	 * to provide a stat object that should contain the full graph of folders up to all of the
@@ -66,88 +91,85 @@ export interface IFileService {
 	 * If the optional parameter "resolveSingleChildDescendants" is specified in options,
 	 * the stat service is asked to automatically resolve child folders that only
 	 * contain a single element.
+	 *
+	 * If the optional parameter "resolveMetadata" is specified in options,
+	 * the stat will contain metadata information such as size, mtime and etag.
 	 */
-	resolveFile(resource: URI, options?: IResolveFileOptions): TPromise<IFileStat>;
+	resolve(resource: URI, options: IResolveMetadataFileOptions): Promise<IFileStatWithMetadata>;
+	resolve(resource: URI, options?: IResolveFileOptions): Promise<IFileStat>;
 
 	/**
-	 * Same as resolveFile but supports resolving mulitple resources in parallel.
+	 * Same as resolve() but supports resolving multiple resources in parallel.
 	 * If one of the resolve targets fails to resolve returns a fake IFileStat instead of making the whole call fail.
 	 */
-	resolveFiles(toResolve: { resource: URI, options?: IResolveFileOptions }[]): TPromise<IResolveFileResult[]>;
+	resolveAll(toResolve: { resource: URI, options: IResolveMetadataFileOptions }[]): Promise<IResolveFileResult[]>;
+	resolveAll(toResolve: { resource: URI, options?: IResolveFileOptions }[]): Promise<IResolveFileResult[]>;
 
 	/**
-	 *Finds out if a file identified by the resource exists.
+	 * Finds out if a file/folder identified by the resource exists.
 	 */
-	existsFile(resource: URI): TPromise<boolean>;
+	exists(resource: URI): Promise<boolean>;
 
 	/**
 	 * Resolve the contents of a file identified by the resource.
 	 *
 	 * The returned object contains properties of the file and the full value as string.
 	 */
-	resolveContent(resource: URI, options?: IResolveContentOptions): TPromise<IContent>;
+	resolveContent(resource: URI, options?: IResolveContentOptions): Promise<IContent>;
 
 	/**
 	 * Resolve the contents of a file identified by the resource.
 	 *
 	 * The returned object contains properties of the file and the value as a readable stream.
 	 */
-	resolveStreamContent(resource: URI, options?: IResolveContentOptions): TPromise<IStreamContent>;
+	resolveStreamContent(resource: URI, options?: IResolveContentOptions): Promise<IStreamContent>;
 
 	/**
 	 * Updates the content replacing its previous value.
 	 */
-	updateContent(resource: URI, value: string | ITextSnapshot, options?: IUpdateContentOptions): TPromise<IFileStat>;
+	writeFile(resource: URI, bufferOrReadable: VSBuffer | VSBufferReadable, options?: IWriteFileOptions): Promise<IFileStatWithMetadata>;
 
 	/**
-	 * Moves the file to a new path identified by the resource.
+	 * Moves the file/folder to a new path identified by the resource.
 	 *
 	 * The optional parameter overwrite can be set to replace an existing file at the location.
 	 */
-	moveFile(source: URI, target: URI, overwrite?: boolean): TPromise<IFileStat>;
+	move(source: URI, target: URI, overwrite?: boolean): Promise<IFileStatWithMetadata>;
 
 	/**
-	 * Copies the file to a path identified by the resource.
+	 * Copies the file/folder to a path identified by the resource.
 	 *
 	 * The optional parameter overwrite can be set to replace an existing file at the location.
 	 */
-	copyFile(source: URI, target: URI, overwrite?: boolean): TPromise<IFileStat>;
+	copy(source: URI, target: URI, overwrite?: boolean): Promise<IFileStatWithMetadata>;
 
 	/**
-	 * Creates a new file with the given path. The returned promise
+	 * Creates a new file with the given path and optional contents. The returned promise
 	 * will have the stat model object as a result.
 	 *
 	 * The optional parameter content can be used as value to fill into the new file.
 	 */
-	createFile(resource: URI, content?: string, options?: ICreateFileOptions): TPromise<IFileStat>;
+	createFile(resource: URI, bufferOrReadable?: VSBuffer | VSBufferReadable, options?: ICreateFileOptions): Promise<IFileStatWithMetadata>;
 
 	/**
 	 * Creates a new folder with the given path. The returned promise
 	 * will have the stat model object as a result.
 	 */
-	createFolder(resource: URI): TPromise<IFileStat>;
+	createFolder(resource: URI): Promise<IFileStatWithMetadata>;
 
 	/**
-	 * Renames the provided file to use the new name. The returned promise
-	 * will have the stat model object as a result.
+	 * Deletes the provided file. The optional useTrash parameter allows to
+	 * move the file to trash. The optional recursive parameter allows to delete
+	 * non-empty folders recursively.
 	 */
-	rename(resource: URI, newName: string): TPromise<IFileStat>;
+	del(resource: URI, options?: { useTrash?: boolean, recursive?: boolean }): Promise<void>;
 
 	/**
-	 * Deletes the provided file.  The optional useTrash parameter allows to
-	 * move the file to trash.
+	 * Allows to start a watcher that reports file/folder change events on the provided resource.
+	 *
+	 * Note: watching a folder does not report events recursively for child folders yet.
 	 */
-	del(resource: URI, useTrash?: boolean): TPromise<void>;
-
-	/**
-	 * Allows to start a watcher that reports file change events on the provided resource.
-	 */
-	watchFileChanges(resource: URI): void;
-
-	/**
-	 * Allows to stop a watcher on the provided resource or absolute fs path.
-	 */
-	unwatchFileChanges(resource: URI): void;
+	watch(resource: URI): IDisposable;
 
 	/**
 	 * Frees up any resources occupied by this service.
@@ -162,6 +184,15 @@ export interface FileOverwriteOptions {
 export interface FileWriteOptions {
 	overwrite: boolean;
 	create: boolean;
+}
+
+export interface FileOpenOptions {
+	create: boolean;
+}
+
+export interface FileDeleteOptions {
+	recursive: boolean;
+	useTrash: boolean;
 }
 
 export enum FileType {
@@ -183,36 +214,142 @@ export interface IWatchOptions {
 	excludes: string[];
 }
 
-export enum FileSystemProviderCapabilities {
+export const enum FileSystemProviderCapabilities {
 	FileReadWrite = 1 << 1,
 	FileOpenReadWriteClose = 1 << 2,
 	FileFolderCopy = 1 << 3,
 
-	PathCaseSensitive = 1 << 10
+	PathCaseSensitive = 1 << 10,
+	Readonly = 1 << 11,
+
+	Trash = 1 << 12
 }
 
 export interface IFileSystemProvider {
 
 	readonly capabilities: FileSystemProviderCapabilities;
+	onDidChangeCapabilities: Event<void>;
+
+	onDidErrorOccur?: Event<Error>; // TODO@ben remove once file watchers are solid
 
 	onDidChangeFile: Event<IFileChange[]>;
 	watch(resource: URI, opts: IWatchOptions): IDisposable;
 
-	stat(resource: URI): TPromise<IStat>;
-	mkdir(resource: URI): TPromise<void>;
-	readdir(resource: URI): TPromise<[string, FileType][]>;
-	delete(resource: URI): TPromise<void>;
+	stat(resource: URI): Promise<IStat>;
+	mkdir(resource: URI): Promise<void>;
+	readdir(resource: URI): Promise<[string, FileType][]>;
+	delete(resource: URI, opts: FileDeleteOptions): Promise<void>;
 
-	rename(from: URI, to: URI, opts: FileOverwriteOptions): TPromise<void>;
-	copy?(from: URI, to: URI, opts: FileOverwriteOptions): TPromise<void>;
+	rename(from: URI, to: URI, opts: FileOverwriteOptions): Promise<void>;
+	copy?(from: URI, to: URI, opts: FileOverwriteOptions): Promise<void>;
 
-	readFile?(resource: URI): TPromise<Uint8Array>;
-	writeFile?(resource: URI, content: Uint8Array, opts: FileWriteOptions): TPromise<void>;
+	readFile?(resource: URI): Promise<Uint8Array>;
+	writeFile?(resource: URI, content: Uint8Array, opts: FileWriteOptions): Promise<void>;
 
-	open?(resource: URI): TPromise<number>;
-	close?(fd: number): TPromise<void>;
-	read?(fd: number, pos: number, data: Uint8Array, offset: number, length: number): TPromise<number>;
-	write?(fd: number, pos: number, data: Uint8Array, offset: number, length: number): TPromise<number>;
+	open?(resource: URI, opts: FileOpenOptions): Promise<number>;
+	close?(fd: number): Promise<void>;
+	read?(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number>;
+	write?(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number>;
+}
+
+export interface IFileSystemProviderWithFileReadWriteCapability extends IFileSystemProvider {
+	readFile(resource: URI): Promise<Uint8Array>;
+	writeFile(resource: URI, content: Uint8Array, opts: FileWriteOptions): Promise<void>;
+}
+
+export function hasReadWriteCapability(provider: IFileSystemProvider): provider is IFileSystemProviderWithFileReadWriteCapability {
+	return !!(provider.capabilities & FileSystemProviderCapabilities.FileReadWrite);
+}
+
+export interface IFileSystemProviderWithFileFolderCopyCapability extends IFileSystemProvider {
+	copy(from: URI, to: URI, opts: FileOverwriteOptions): Promise<void>;
+}
+
+export function hasFileFolderCopyCapability(provider: IFileSystemProvider): provider is IFileSystemProviderWithFileFolderCopyCapability {
+	return !!(provider.capabilities & FileSystemProviderCapabilities.FileFolderCopy);
+}
+
+export interface IFileSystemProviderWithOpenReadWriteCloseCapability extends IFileSystemProvider {
+	open(resource: URI, opts: FileOpenOptions): Promise<number>;
+	close(fd: number): Promise<void>;
+	read(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number>;
+	write(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number>;
+}
+
+export function hasOpenReadWriteCloseCapability(provider: IFileSystemProvider): provider is IFileSystemProviderWithOpenReadWriteCloseCapability {
+	return !!(provider.capabilities & FileSystemProviderCapabilities.FileOpenReadWriteClose);
+}
+
+export enum FileSystemProviderErrorCode {
+	FileExists = 'EntryExists',
+	FileNotFound = 'EntryNotFound',
+	FileNotADirectory = 'EntryNotADirectory',
+	FileIsADirectory = 'EntryIsADirectory',
+	NoPermissions = 'NoPermissions',
+	Unavailable = 'Unavailable',
+	Unknown = 'Unknown'
+}
+
+export class FileSystemProviderError extends Error {
+
+	constructor(message: string, public readonly code: FileSystemProviderErrorCode) {
+		super(message);
+	}
+}
+
+export function createFileSystemProviderError(error: Error, code: FileSystemProviderErrorCode): FileSystemProviderError {
+	const providerError = new FileSystemProviderError(error.toString(), code);
+	markAsFileSystemProviderError(providerError, code);
+
+	return providerError;
+}
+
+export function markAsFileSystemProviderError(error: Error, code: FileSystemProviderErrorCode): Error {
+	error.name = code ? `${code} (FileSystemError)` : `FileSystemError`;
+
+	return error;
+}
+
+export function toFileSystemProviderErrorCode(error: Error): FileSystemProviderErrorCode {
+
+	// FileSystemProviderError comes with the code
+	if (error instanceof FileSystemProviderError) {
+		return error.code;
+	}
+
+	// Any other error, check for name match by assuming that the error
+	// went through the markAsFileSystemProviderError() method
+	const match = /^(.+) \(FileSystemError\)$/.exec(error.name);
+	if (!match) {
+		return FileSystemProviderErrorCode.Unknown;
+	}
+
+	switch (match[1]) {
+		case FileSystemProviderErrorCode.FileExists: return FileSystemProviderErrorCode.FileExists;
+		case FileSystemProviderErrorCode.FileIsADirectory: return FileSystemProviderErrorCode.FileIsADirectory;
+		case FileSystemProviderErrorCode.FileNotADirectory: return FileSystemProviderErrorCode.FileNotADirectory;
+		case FileSystemProviderErrorCode.FileNotFound: return FileSystemProviderErrorCode.FileNotFound;
+		case FileSystemProviderErrorCode.NoPermissions: return FileSystemProviderErrorCode.NoPermissions;
+		case FileSystemProviderErrorCode.Unavailable: return FileSystemProviderErrorCode.Unavailable;
+	}
+
+	return FileSystemProviderErrorCode.Unknown;
+}
+
+export function toFileOperationResult(error: Error): FileOperationResult {
+	switch (toFileSystemProviderErrorCode(error)) {
+		case FileSystemProviderErrorCode.FileNotFound:
+			return FileOperationResult.FILE_NOT_FOUND;
+		case FileSystemProviderErrorCode.FileIsADirectory:
+			return FileOperationResult.FILE_IS_DIRECTORY;
+		case FileSystemProviderErrorCode.NoPermissions:
+			return FileOperationResult.FILE_PERMISSION_DENIED;
+		case FileSystemProviderErrorCode.FileExists:
+			return FileOperationResult.FILE_MOVE_CONFLICT;
+		case FileSystemProviderErrorCode.FileNotADirectory:
+		default:
+			return FileOperationResult.FILE_OTHER_ERROR;
+	}
 }
 
 export interface IFileSystemProviderRegistrationEvent {
@@ -221,7 +358,12 @@ export interface IFileSystemProviderRegistrationEvent {
 	provider?: IFileSystemProvider;
 }
 
-export enum FileOperation {
+export interface IFileSystemProviderActivationEvent {
+	scheme: string;
+	join(promise: Promise<void>): void;
+}
+
+export const enum FileOperation {
 	CREATE,
 	DELETE,
 	MOVE,
@@ -230,26 +372,21 @@ export enum FileOperation {
 
 export class FileOperationEvent {
 
-	constructor(private _resource: URI, private _operation: FileOperation, private _target?: IFileStat) {
-	}
+	constructor(resource: URI, operation: FileOperation.DELETE);
+	constructor(resource: URI, operation: FileOperation.CREATE | FileOperation.MOVE | FileOperation.COPY, target: IFileStatWithMetadata);
+	constructor(public readonly resource: URI, public readonly operation: FileOperation, public readonly target?: IFileStatWithMetadata) { }
 
-	public get resource(): URI {
-		return this._resource;
-	}
-
-	public get target(): IFileStat {
-		return this._target;
-	}
-
-	public get operation(): FileOperation {
-		return this._operation;
+	isOperation(operation: FileOperation.DELETE): boolean;
+	isOperation(operation: FileOperation.MOVE | FileOperation.COPY | FileOperation.CREATE): this is { readonly target: IFileStatWithMetadata };
+	isOperation(operation: FileOperation): boolean {
+		return this.operation === operation;
 	}
 }
 
 /**
  * Possible changes that can occur to a file.
  */
-export enum FileChangeType {
+export const enum FileChangeType {
 	UPDATED = 0,
 	ADDED = 1,
 	DELETED = 2
@@ -279,27 +416,29 @@ export class FileChangesEvent {
 		this._changes = changes;
 	}
 
-	public get changes() {
+	get changes() {
 		return this._changes;
 	}
 
 	/**
-	 * Returns true if this change event contains the provided file with the given change type. In case of
+	 * Returns true if this change event contains the provided file with the given change type (if provided). In case of
 	 * type DELETED, this method will also return true if a folder got deleted that is the parent of the
 	 * provided file path.
 	 */
-	public contains(resource: URI, type: FileChangeType): boolean {
+	contains(resource: URI, type?: FileChangeType): boolean {
 		if (!resource) {
 			return false;
 		}
 
+		const checkForChangeType = !isUndefinedOrNull(type);
+
 		return this._changes.some(change => {
-			if (change.type !== type) {
+			if (checkForChangeType && change.type !== type) {
 				return false;
 			}
 
 			// For deleted also return true when deleted folder is parent of target path
-			if (type === FileChangeType.DELETED) {
+			if (change.type === FileChangeType.DELETED) {
 				return isEqualOrParent(resource, change.resource, !isLinux /* ignorecase */);
 			}
 
@@ -310,42 +449,42 @@ export class FileChangesEvent {
 	/**
 	 * Returns the changes that describe added files.
 	 */
-	public getAdded(): IFileChange[] {
+	getAdded(): IFileChange[] {
 		return this.getOfType(FileChangeType.ADDED);
 	}
 
 	/**
 	 * Returns if this event contains added files.
 	 */
-	public gotAdded(): boolean {
+	gotAdded(): boolean {
 		return this.hasType(FileChangeType.ADDED);
 	}
 
 	/**
 	 * Returns the changes that describe deleted files.
 	 */
-	public getDeleted(): IFileChange[] {
+	getDeleted(): IFileChange[] {
 		return this.getOfType(FileChangeType.DELETED);
 	}
 
 	/**
 	 * Returns if this event contains deleted files.
 	 */
-	public gotDeleted(): boolean {
+	gotDeleted(): boolean {
 		return this.hasType(FileChangeType.DELETED);
 	}
 
 	/**
 	 * Returns the changes that describe updated files.
 	 */
-	public getUpdated(): IFileChange[] {
+	getUpdated(): IFileChange[] {
 		return this.getOfType(FileChangeType.UPDATED);
 	}
 
 	/**
 	 * Returns if this event contains updated files.
 	 */
-	public gotUpdated(): boolean {
+	gotUpdated(): boolean {
 		return this.hasType(FileChangeType.UPDATED);
 	}
 
@@ -369,8 +508,8 @@ export function isParent(path: string, candidate: string, ignoreCase?: boolean):
 		return false;
 	}
 
-	if (candidate.charAt(candidate.length - 1) !== paths.nativeSep) {
-		candidate += paths.nativeSep;
+	if (candidate.charAt(candidate.length - 1) !== sep) {
+		candidate += sep;
 	}
 
 	if (ignoreCase) {
@@ -380,7 +519,7 @@ export function isParent(path: string, candidate: string, ignoreCase?: boolean):
 	return path.indexOf(candidate) === 0;
 }
 
-export interface IBaseStat {
+interface IBaseStat {
 
 	/**
 	 * The unified resource identifier of this file or folder.
@@ -394,16 +533,41 @@ export interface IBaseStat {
 	name: string;
 
 	/**
+	 * The size of the file.
+	 *
+	 * The value may or may not be resolved as
+	 * it is optional.
+	 */
+	size?: number;
+
+	/**
 	 * The last modifictaion date represented
 	 * as millis from unix epoch.
+	 *
+	 * The value may or may not be resolved as
+	 * it is optional.
 	 */
-	mtime: number;
+	mtime?: number;
 
 	/**
 	 * A unique identifier thet represents the
 	 * current state of the file or directory.
+	 *
+	 * The value may or may not be resolved as
+	 * it is optional.
 	 */
+	etag?: string;
+
+	/**
+	 * The resource is readonly.
+	 */
+	isReadonly?: boolean;
+}
+
+export interface IBaseStatWithMetadata extends IBaseStat {
+	mtime: number;
 	etag: string;
+	size: number;
 }
 
 /**
@@ -426,22 +590,28 @@ export interface IFileStat extends IBaseStat {
 	 * The children of the file stat or undefined if none.
 	 */
 	children?: IFileStat[];
+}
 
-	/**
-	 * The size of the file if known.
-	 */
-	size?: number;
+export interface IFileStatWithMetadata extends IFileStat, IBaseStatWithMetadata {
+	mtime: number;
+	etag: string;
+	size: number;
+	children?: IFileStatWithMetadata[];
 }
 
 export interface IResolveFileResult {
-	stat: IFileStat;
+	stat?: IFileStat;
 	success: boolean;
+}
+
+export interface IResolveFileResultWithMetadata extends IResolveFileResult {
+	stat?: IFileStatWithMetadata;
 }
 
 /**
  * Content and meta information of a file.
  */
-export interface IContent extends IBaseStat {
+export interface IContent extends IBaseStatWithMetadata {
 
 	/**
 	 * The content of a text file.
@@ -478,23 +648,16 @@ export interface IStringStream {
  * Will return null when finished.
  */
 export interface ITextSnapshot {
-	read(): string;
+	read(): string | null;
 }
 
-export class StringSnapshot implements ITextSnapshot {
-	constructor(private _value: string) { }
-	read(): string {
-		let ret = this._value;
-		this._value = null;
-		return ret;
-	}
-}
 /**
  * Helper method to convert a snapshot into its full string form.
  */
 export function snapshotToString(snapshot: ITextSnapshot): string {
 	const chunks: string[] = [];
-	let chunk: string;
+
+	let chunk: string | null;
 	while (typeof (chunk = snapshot.read()) === 'string') {
 		chunks.push(chunk);
 	}
@@ -502,10 +665,71 @@ export function snapshotToString(snapshot: ITextSnapshot): string {
 	return chunks.join('');
 }
 
+export function stringToSnapshot(value: string): ITextSnapshot {
+	let done = false;
+
+	return {
+		read(): string | null {
+			if (!done) {
+				done = true;
+
+				return value;
+			}
+
+			return null;
+		}
+	};
+}
+
+export class TextSnapshotReadable implements VSBufferReadable {
+	private preambleHandled: boolean;
+
+	constructor(private snapshot: ITextSnapshot, private preamble?: string) { }
+
+	read(): VSBuffer | null {
+		let value = this.snapshot.read();
+
+		// Handle preamble if provided
+		if (!this.preambleHandled) {
+			this.preambleHandled = true;
+
+			if (typeof this.preamble === 'string') {
+				if (typeof value === 'string') {
+					value = this.preamble + value;
+				} else {
+					value = this.preamble;
+				}
+			}
+		}
+
+		if (typeof value === 'string') {
+			return VSBuffer.fromString(value);
+		}
+
+		return null;
+	}
+}
+
+export function toBufferOrReadable(value: string): VSBuffer;
+export function toBufferOrReadable(value: ITextSnapshot): VSBufferReadable;
+export function toBufferOrReadable(value: string | ITextSnapshot): VSBuffer | VSBufferReadable;
+export function toBufferOrReadable(value: string | ITextSnapshot | undefined): VSBuffer | VSBufferReadable | undefined;
+export function toBufferOrReadable(value: string | ITextSnapshot | undefined): VSBuffer | VSBufferReadable | undefined {
+	if (typeof value === 'undefined') {
+		return undefined;
+	}
+
+	if (typeof value === 'string') {
+		return VSBuffer.fromString(value);
+	}
+
+	return new TextSnapshotReadable(value);
+}
+
 /**
  * Streamable content and meta information of a file.
  */
-export interface IStreamContent extends IBaseStat {
+export interface IStreamContent extends IBaseStatWithMetadata {
 
 	/**
 	 * The streamable content of a text file.
@@ -552,7 +776,20 @@ export interface IResolveContentOptions {
 	position?: number;
 }
 
-export interface IUpdateContentOptions {
+export interface IWriteFileOptions {
+
+	/**
+	 * The last known modification time of the file. This can be used to prevent dirty writes.
+	 */
+	mtime?: number;
+
+	/**
+	 * The etag of the file. This can be used to prevent dirty writes.
+	 */
+	etag?: string;
+}
+
+export interface IWriteTextFileOptions extends IWriteFileOptions {
 
 	/**
 	 * The encoding to use when updating a file.
@@ -574,26 +811,30 @@ export interface IUpdateContentOptions {
 	 * ask the user to authenticate as super user.
 	 */
 	writeElevated?: boolean;
-
-	/**
-	 * The last known modification time of the file. This can be used to prevent dirty writes.
-	 */
-	mtime?: number;
-
-	/**
-	 * The etag of the file. This can be used to prevent dirty writes.
-	 */
-	etag?: string;
-
-	/**
-	 * Run mkdirp before saving.
-	 */
-	mkdirp?: boolean;
 }
 
 export interface IResolveFileOptions {
+
+	/**
+	 * Automatically continue resolving children of a directory until the provided resources
+	 * are found.
+	 */
 	resolveTo?: URI[];
+
+	/**
+	 * Automatically continue resolving children of a directory if the number of children is 1.
+	 */
 	resolveSingleChildDescendants?: boolean;
+
+	/**
+	 * Will resolve mtime, size and etag of files if enabled. This can have a negative impact
+	 * on performance and thus should only be used when these values are required.
+	 */
+	resolveMetadata?: boolean;
+}
+
+export interface IResolveMetadataFileOptions extends IResolveFileOptions {
+	resolveMetadata: true;
 }
 
 export interface ICreateFileOptions {
@@ -606,16 +847,16 @@ export interface ICreateFileOptions {
 }
 
 export class FileOperationError extends Error {
-	constructor(message: string, public fileOperationResult: FileOperationResult, public options?: IResolveContentOptions & IUpdateContentOptions & ICreateFileOptions) {
+	constructor(message: string, public fileOperationResult: FileOperationResult, public options?: IResolveContentOptions & IWriteTextFileOptions & ICreateFileOptions) {
 		super(message);
 	}
 
-	static isFileOperationError(obj: any): obj is FileOperationError {
+	static isFileOperationError(obj: unknown): obj is FileOperationError {
 		return obj instanceof Error && !isUndefinedOrNull((obj as FileOperationError).fileOperationResult);
 	}
 }
 
-export enum FileOperationResult {
+export const enum FileOperationResult {
 	FILE_IS_BINARY,
 	FILE_IS_DIRECTORY,
 	FILE_NOT_FOUND,
@@ -626,7 +867,8 @@ export enum FileOperationResult {
 	FILE_PERMISSION_DENIED,
 	FILE_TOO_LARGE,
 	FILE_INVALID_PATH,
-	FILE_EXCEED_MEMORY_LIMIT
+	FILE_EXCEED_MEMORY_LIMIT,
+	FILE_OTHER_ERROR
 }
 
 export const AutoSaveConfiguration = {
@@ -659,8 +901,8 @@ export interface IFilesConfiguration {
 		autoSave: string;
 		autoSaveDelay: number;
 		eol: string;
+		enableTrash: boolean;
 		hotExit: string;
-		useExperimentalFileWatcher: boolean;
 	};
 }
 
@@ -913,3 +1155,30 @@ export enum FileKind {
 
 export const MIN_MAX_MEMORY_SIZE_MB = 2048;
 export const FALLBACK_MAX_MEMORY_SIZE_MB = 4096;
+
+export function etag(mtime: number, size: number): string;
+export function etag(mtime: number | undefined, size: number | undefined): string | undefined;
+export function etag(mtime: number | undefined, size: number | undefined): string | undefined {
+	if (typeof size !== 'number' || typeof mtime !== 'number') {
+		return undefined;
+	}
+
+	return mtime.toString(29) + size.toString(31);
+}
+
+
+// TODO@ben remove traces of legacy file service
+export const ILegacyFileService = createDecorator<ILegacyFileService>('legacyFileService');
+export interface ILegacyFileService extends IDisposable {
+	_serviceBrand: any;
+
+	encoding: IResourceEncodings;
+
+	onAfterOperation: Event<FileOperationEvent>;
+
+	registerProvider(scheme: string, provider: IFileSystemProvider): IDisposable;
+
+	resolveContent(resource: URI, options?: IResolveContentOptions): Promise<IContent>;
+
+	resolveStreamContent(resource: URI, options?: IResolveContentOptions): Promise<IStreamContent>;
+}
